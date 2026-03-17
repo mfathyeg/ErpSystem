@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>ErpSystem.API</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Asp.Versioning.Mvc" Version="8.1.0" />
+    <PackageReference Include="Asp.Versioning.Mvc.ApiExplorer" Version="8.1.0" />
+    <PackageReference Include="AspNetCore.HealthChecks.Redis" Version="9.0.0" />
+    <PackageReference Include="AspNetCore.HealthChecks.SqlServer" Version="9.0.0" />
+    <PackageReference Include="AspNetCore.HealthChecks.UI.Client" Version="9.0.0" />
+    <PackageReference Include="Hangfire.AspNetCore" Version="1.8.21" />
+    <PackageReference Include="MediatR" Version="12.5.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.3" />
+    <PackageReference Include="Serilog.AspNetCore" Version="9.0.0" />
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="7.3.1" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ErpSystem.Application\ErpSystem.Application.csproj" />
+    <ProjectReference Include="..\ErpSystem.Infrastructure\ErpSystem.Infrastructure.csproj" />
+    <ProjectReference Include="..\Modules\Configuration\ErpSystem.Modules.Configuration\ErpSystem.Modules.Configuration.csproj" />
+    <ProjectReference Include="..\Modules\Finance\ErpSystem.Modules.Finance\ErpSystem.Modules.Finance.csproj" />
+    <ProjectReference Include="..\Modules\Identity\ErpSystem.Modules.Identity\ErpSystem.Modules.Identity.csproj" />
+    <ProjectReference Include="..\Modules\Inventory\ErpSystem.Modules.Inventory\ErpSystem.Modules.Inventory.csproj" />
+    <ProjectReference Include="..\Modules\Notifications\ErpSystem.Modules.Notifications\ErpSystem.Modules.Notifications.csproj" />
+    <ProjectReference Include="..\Modules\Orders\ErpSystem.Modules.Orders\ErpSystem.Modules.Orders.csproj" />
+    <ProjectReference Include="..\Modules\Users\ErpSystem.Modules.Users\ErpSystem.Modules.Users.csproj" />
+  </ItemGroup>
+
+</Project>

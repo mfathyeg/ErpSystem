@@ -1,0 +1,17 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <WarningLevel>5</WarningLevel>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Authors>ERP System Team</Authors>
+    <Company>Your Company</Company>
+    <Product>ERP System</Product>
+    <Copyright>Copyright (c) 2024</Copyright>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+</Project>
