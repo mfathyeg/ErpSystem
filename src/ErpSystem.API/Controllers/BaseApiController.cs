@@ -1,7 +1,8 @@
-using Asp.Versioning;
 using ErpSystem.SharedKernel.Results;
 using MediatR;
 using Microsoft.AspNetCore.Mvc;
+using ApiVersion = Asp.Versioning.ApiVersion;
+using ApiVersionAttribute = Microsoft.AspNetCore.Mvc.ApiVersionAttribute;
 
 namespace ErpSystem.API.Controllers;
 

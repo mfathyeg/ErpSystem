@@ -88,17 +88,7 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
-// Authentication
-builder.Services.AddAuthentication("Bearer")
-    .AddJwtBearer("Bearer", options =>
-    {
-        options.Authority = builder.Configuration["Identity:Authority"];
-        options.TokenValidationParameters = new Microsoft.IdentityModel.Tokens.TokenValidationParameters
-        {
-            ValidateAudience = false
-        };
-    });
-
+// Authorization (Authentication is configured in Identity module)
 builder.Services.AddAuthorization();
 
 // SignalR
@@ -166,8 +156,17 @@ app.MapHub<ErpSystem.Modules.Notifications.Hubs.NotificationHub>("/hubs/notifica
 if (app.Environment.IsDevelopment())
 {
     using var scope = app.Services.CreateScope();
+
+    // ERP DbContext migrations
     var dbContext = scope.ServiceProvider.GetRequiredService<ErpDbContext>();
     await dbContext.Database.MigrateAsync();
+
+    // Identity DbContext migrations
+    var identityDbContext = scope.ServiceProvider.GetRequiredService<ErpSystem.Modules.Identity.Data.IdentityDbContext>();
+    await identityDbContext.Database.MigrateAsync();
+
+    // Seed Identity data
+    await ErpSystem.Modules.Identity.Data.IdentitySeeder.SeedAsync(app.Services);
 }
 
 app.Run();
