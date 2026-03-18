@@ -1,7 +1,12 @@
 using Asp.Versioning;
+using ErpSystem.Domain.Common.ValueObjects;
+using ErpSystem.Modules.Inventory.Domain.Entities;
+using ErpSystem.Modules.Inventory.Domain.ValueObjects;
+using ErpSystem.Modules.Inventory.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace ErpSystem.Modules.Inventory.Api;
 
@@ -11,11 +16,16 @@ namespace ErpSystem.Modules.Inventory.Api;
 [Authorize]
 public class InventoryController : ControllerBase
 {
-    private static readonly List<InventoryItemDto> _items = GenerateMockItems();
+    private readonly InventoryDbContext _context;
+
+    public InventoryController(InventoryDbContext context)
+    {
+        _context = context;
+    }
 
     [HttpGet]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetItems(
+    public async Task<IActionResult> GetItems(
         [FromQuery] int pageNumber = 1,
         [FromQuery] int pageSize = 10,
         [FromQuery] string? sortBy = "name",
@@ -23,32 +33,50 @@ public class InventoryController : ControllerBase
         [FromQuery] string? searchTerm = null,
         [FromQuery] string? category = null)
     {
-        var query = _items.AsQueryable();
+        var query = _context.Products.AsQueryable();
 
         if (!string.IsNullOrEmpty(searchTerm))
         {
-            query = query.Where(i =>
-                i.Name.Contains(searchTerm, StringComparison.OrdinalIgnoreCase) ||
-                i.Sku.Contains(searchTerm, StringComparison.OrdinalIgnoreCase) ||
-                i.Description.Contains(searchTerm, StringComparison.OrdinalIgnoreCase));
+            query = query.Where(p =>
+                p.Name.Contains(searchTerm) ||
+                p.Sku.Contains(searchTerm) ||
+                (p.Description != null && p.Description.Contains(searchTerm)));
         }
 
         if (!string.IsNullOrEmpty(category))
         {
-            query = query.Where(i => i.Category.Equals(category, StringComparison.OrdinalIgnoreCase));
+            query = query.Where(p => p.Category.Name == category || p.Category.Code == category);
         }
+
+        var totalCount = await query.CountAsync();
 
         query = sortBy?.ToLower() switch
         {
-            "sku" => sortDirection == "asc" ? query.OrderBy(i => i.Sku) : query.OrderByDescending(i => i.Sku),
-            "quantity" => sortDirection == "asc" ? query.OrderBy(i => i.Quantity) : query.OrderByDescending(i => i.Quantity),
-            "unitprice" => sortDirection == "asc" ? query.OrderBy(i => i.UnitPrice) : query.OrderByDescending(i => i.UnitPrice),
-            "category" => sortDirection == "asc" ? query.OrderBy(i => i.Category) : query.OrderByDescending(i => i.Category),
-            _ => sortDirection == "asc" ? query.OrderBy(i => i.Name) : query.OrderByDescending(i => i.Name)
+            "sku" => sortDirection == "asc" ? query.OrderBy(p => p.Sku) : query.OrderByDescending(p => p.Sku),
+            "quantity" => sortDirection == "asc" ? query.OrderBy(p => p.StockQuantity.Value) : query.OrderByDescending(p => p.StockQuantity.Value),
+            "unitprice" => sortDirection == "asc" ? query.OrderBy(p => p.UnitPrice.Amount) : query.OrderByDescending(p => p.UnitPrice.Amount),
+            "category" => sortDirection == "asc" ? query.OrderBy(p => p.Category.Name) : query.OrderByDescending(p => p.Category.Name),
+            _ => sortDirection == "asc" ? query.OrderBy(p => p.Name) : query.OrderByDescending(p => p.Name)
         };
 
-        var totalCount = query.Count();
-        var data = query.Skip((pageNumber - 1) * pageSize).Take(pageSize).ToList();
+        var products = await query
+            .Skip((pageNumber - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync();
+
+        var data = products.Select(p => new InventoryItemDto
+        {
+            Id = p.Id.ToString(),
+            Sku = p.Sku,
+            Name = p.Name,
+            Description = p.Description ?? string.Empty,
+            Category = p.Category.Name,
+            Quantity = p.StockQuantity.Value,
+            ReorderLevel = p.ReorderLevel,
+            UnitPrice = p.UnitPrice.Amount,
+            IsActive = p.IsActive,
+            CreatedAt = p.CreatedAt
+        }).ToList();
 
         return Ok(new PaginatedResponse<InventoryItemDto>
         {
@@ -59,148 +87,246 @@ public class InventoryController : ControllerBase
         });
     }
 
-    [HttpGet("{id:int}")]
+    [HttpGet("{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult GetItem(int id)
+    public async Task<IActionResult> GetItem(string id)
     {
-        var item = _items.FirstOrDefault(i => i.Id == id);
-        if (item == null)
+        if (!Guid.TryParse(id, out var productId))
             return NotFound(new { message = "المنتج غير موجود" });
 
-        return Ok(item);
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+            return NotFound(new { message = "المنتج غير موجود" });
+
+        return Ok(new InventoryItemDto
+        {
+            Id = product.Id.ToString(),
+            Sku = product.Sku,
+            Name = product.Name,
+            Description = product.Description ?? string.Empty,
+            Category = product.Category.Name,
+            Quantity = product.StockQuantity.Value,
+            ReorderLevel = product.ReorderLevel,
+            UnitPrice = product.UnitPrice.Amount,
+            IsActive = product.IsActive,
+            CreatedAt = product.CreatedAt
+        });
     }
 
     [HttpPost]
     [ProducesResponseType(StatusCodes.Status201Created)]
-    public IActionResult CreateItem([FromBody] CreateInventoryItemRequest request)
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> CreateItem([FromBody] CreateInventoryItemRequest request)
     {
-        var newId = _items.Max(i => i.Id) + 1;
-        var item = new InventoryItemDto
+        var existingSku = await _context.Products.FirstOrDefaultAsync(p => p.Sku == request.Sku);
+        if (existingSku != null)
+            return BadRequest(new { message = "رمز المنتج (SKU) موجود بالفعل" });
+
+        var category = ProductCategory.Create(request.Category, request.Category);
+        var unitPrice = Money.Create(request.UnitPrice, request.Currency ?? "SAR");
+
+        var product = Product.Create(
+            request.Sku,
+            request.Name,
+            request.Description,
+            category,
+            unitPrice,
+            request.Quantity,
+            request.ReorderLevel,
+            request.SupplierId);
+
+        _context.Products.Add(product);
+        await _context.SaveChangesAsync();
+
+        return CreatedAtAction(nameof(GetItem), new { id = product.Id }, new InventoryItemDto
         {
-            Id = newId,
-            Sku = request.Sku,
-            Name = request.Name,
-            Description = request.Description ?? string.Empty,
-            Category = request.Category,
-            Quantity = request.Quantity,
-            ReorderLevel = request.ReorderLevel,
-            UnitPrice = request.UnitPrice,
-            IsActive = true,
-            CreatedAt = DateTime.UtcNow
-        };
-
-        _items.Add(item);
-        return CreatedAtAction(nameof(GetItem), new { id = item.Id }, item);
+            Id = product.Id.ToString(),
+            Sku = product.Sku,
+            Name = product.Name,
+            Description = product.Description ?? string.Empty,
+            Category = product.Category.Name,
+            Quantity = product.StockQuantity.Value,
+            ReorderLevel = product.ReorderLevel,
+            UnitPrice = product.UnitPrice.Amount,
+            IsActive = product.IsActive,
+            CreatedAt = product.CreatedAt
+        });
     }
 
-    [HttpPut("{id:int}")]
+    [HttpPut("{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult UpdateItem(int id, [FromBody] UpdateInventoryItemRequest request)
+    public async Task<IActionResult> UpdateItem(string id, [FromBody] UpdateInventoryItemRequest request)
     {
-        var item = _items.FirstOrDefault(i => i.Id == id);
-        if (item == null)
+        if (!Guid.TryParse(id, out var productId))
             return NotFound(new { message = "المنتج غير موجود" });
 
-        item.Name = request.Name;
-        item.Description = request.Description ?? string.Empty;
-        item.Category = request.Category;
-        item.UnitPrice = request.UnitPrice;
-        item.ReorderLevel = request.ReorderLevel;
-        item.UpdatedAt = DateTime.UtcNow;
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+            return NotFound(new { message = "المنتج غير موجود" });
 
-        return Ok(item);
+        var category = ProductCategory.Create(request.Category, request.Category);
+        var unitPrice = Money.Create(request.UnitPrice, request.Currency ?? "SAR");
+
+        product.UpdateDetails(request.Name, request.Description, category, unitPrice);
+        product.SetReorderLevel(request.ReorderLevel);
+
+        await _context.SaveChangesAsync();
+
+        return Ok(new InventoryItemDto
+        {
+            Id = product.Id.ToString(),
+            Sku = product.Sku,
+            Name = product.Name,
+            Description = product.Description ?? string.Empty,
+            Category = product.Category.Name,
+            Quantity = product.StockQuantity.Value,
+            ReorderLevel = product.ReorderLevel,
+            UnitPrice = product.UnitPrice.Amount,
+            IsActive = product.IsActive,
+            CreatedAt = product.CreatedAt
+        });
     }
 
-    [HttpPatch("{id:int}/stock")]
+    [HttpPatch("{id}/stock")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult UpdateStock(int id, [FromBody] UpdateItemStockRequest request)
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> UpdateStock(string id, [FromBody] UpdateItemStockRequest request)
     {
-        var item = _items.FirstOrDefault(i => i.Id == id);
-        if (item == null)
+        if (!Guid.TryParse(id, out var productId))
             return NotFound(new { message = "المنتج غير موجود" });
 
-        item.Quantity = request.Quantity;
-        item.UpdatedAt = DateTime.UtcNow;
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+            return NotFound(new { message = "المنتج غير موجود" });
 
-        return Ok(item);
+        try
+        {
+            var currentQuantity = product.StockQuantity.Value;
+            var difference = request.Quantity - currentQuantity;
+
+            if (difference > 0)
+            {
+                product.AddStock(difference, request.Reason ?? "تعديل يدوي للمخزون");
+            }
+            else if (difference < 0)
+            {
+                product.RemoveStock(Math.Abs(difference), request.Reason ?? "تعديل يدوي للمخزون");
+            }
+
+            await _context.SaveChangesAsync();
+
+            return Ok(new InventoryItemDto
+            {
+                Id = product.Id.ToString(),
+                Sku = product.Sku,
+                Name = product.Name,
+                Description = product.Description ?? string.Empty,
+                Category = product.Category.Name,
+                Quantity = product.StockQuantity.Value,
+                ReorderLevel = product.ReorderLevel,
+                UnitPrice = product.UnitPrice.Amount,
+                IsActive = product.IsActive,
+                CreatedAt = product.CreatedAt
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
     }
 
-    [HttpDelete("{id:int}")]
+    [HttpDelete("{id}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult DeleteItem(int id)
+    public async Task<IActionResult> DeleteItem(string id)
     {
-        var item = _items.FirstOrDefault(i => i.Id == id);
-        if (item == null)
+        if (!Guid.TryParse(id, out var productId))
             return NotFound(new { message = "المنتج غير موجود" });
 
-        _items.Remove(item);
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+            return NotFound(new { message = "المنتج غير موجود" });
+
+        _context.Products.Remove(product);
+        await _context.SaveChangesAsync();
+
         return NoContent();
     }
 
     [HttpGet("categories")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetCategories()
+    public async Task<IActionResult> GetCategories()
     {
-        var categories = _items.Select(i => i.Category).Distinct().ToList();
+        var categories = await _context.Products
+            .Select(p => p.Category.Name)
+            .Distinct()
+            .ToListAsync();
+
         return Ok(categories);
     }
 
     [HttpGet("low-stock")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetLowStockItems()
+    public async Task<IActionResult> GetLowStockItems()
     {
-        var lowStockItems = _items.Where(i => i.Quantity <= i.ReorderLevel).ToList();
-        return Ok(lowStockItems);
+        var lowStockProducts = await _context.Products
+            .Where(p => p.StockQuantity.Value <= p.ReorderLevel)
+            .ToListAsync();
+
+        var data = lowStockProducts.Select(p => new InventoryItemDto
+        {
+            Id = p.Id.ToString(),
+            Sku = p.Sku,
+            Name = p.Name,
+            Description = p.Description ?? string.Empty,
+            Category = p.Category.Name,
+            Quantity = p.StockQuantity.Value,
+            ReorderLevel = p.ReorderLevel,
+            UnitPrice = p.UnitPrice.Amount,
+            IsActive = p.IsActive,
+            CreatedAt = p.CreatedAt
+        }).ToList();
+
+        return Ok(data);
     }
 
-    private static List<InventoryItemDto> GenerateMockItems()
+    [HttpPatch("{id}/activate")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> ActivateProduct(string id)
     {
-        var categories = new[] { "Electronics", "Furniture", "Office", "Accessories", "Storage" };
-        var products = new[]
-        {
-            ("شاشة كمبيوتر 27 بوصة", "Electronics", 1500.00m),
-            ("كرسي مكتب مريح", "Furniture", 850.00m),
-            ("لوحة مفاتيح لاسلكية", "Accessories", 250.00m),
-            ("ماوس احترافي", "Accessories", 180.00m),
-            ("مكتب خشبي", "Furniture", 2200.00m),
-            ("طابعة ليزر", "Electronics", 1200.00m),
-            ("سماعات رأس", "Accessories", 450.00m),
-            ("كاميرا ويب HD", "Electronics", 320.00m),
-            ("حامل شاشة", "Accessories", 280.00m),
-            ("خزانة ملفات", "Storage", 650.00m),
-            ("لابتوب Dell", "Electronics", 4500.00m),
-            ("كرسي زوار", "Furniture", 350.00m),
-            ("قلم ذكي", "Accessories", 120.00m),
-            ("شاحن لاسلكي", "Accessories", 95.00m),
-            ("رف كتب", "Storage", 420.00m)
-        };
+        if (!Guid.TryParse(id, out var productId))
+            return NotFound(new { message = "المنتج غير موجود" });
 
-        var items = new List<InventoryItemDto>();
-        var random = new Random(42);
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+            return NotFound(new { message = "المنتج غير موجود" });
 
-        for (int i = 0; i < products.Length; i++)
-        {
-            var product = products[i];
-            items.Add(new InventoryItemDto
-            {
-                Id = i + 1,
-                Sku = $"SKU-{(i + 1):D4}",
-                Name = product.Item1,
-                Description = $"وصف {product.Item1}",
-                Category = product.Item2,
-                Quantity = random.Next(0, 150),
-                ReorderLevel = random.Next(10, 30),
-                UnitPrice = product.Item3,
-                IsActive = random.Next(10) > 1,
-                CreatedAt = DateTime.UtcNow.AddDays(-random.Next(1, 180))
-            });
-        }
+        product.Activate();
+        await _context.SaveChangesAsync();
 
-        return items;
+        return Ok(new { id = product.Id, isActive = product.IsActive });
+    }
+
+    [HttpPatch("{id}/deactivate")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> DeactivateProduct(string id)
+    {
+        if (!Guid.TryParse(id, out var productId))
+            return NotFound(new { message = "المنتج غير موجود" });
+
+        var product = await _context.Products.FindAsync(productId);
+        if (product == null)
+            return NotFound(new { message = "المنتج غير موجود" });
+
+        product.Deactivate();
+        await _context.SaveChangesAsync();
+
+        return Ok(new { id = product.Id, isActive = product.IsActive });
     }
 }
 
@@ -214,7 +340,7 @@ public class PaginatedResponse<T>
 
 public class InventoryItemDto
 {
-    public int Id { get; set; }
+    public string Id { get; set; } = string.Empty;
     public string Sku { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
     public string Description { get; set; } = string.Empty;
@@ -224,7 +350,6 @@ public class InventoryItemDto
     public decimal UnitPrice { get; set; }
     public bool IsActive { get; set; }
     public DateTime CreatedAt { get; set; }
-    public DateTime? UpdatedAt { get; set; }
 }
 
 public record CreateInventoryItemRequest(
@@ -234,13 +359,16 @@ public record CreateInventoryItemRequest(
     string Category,
     int Quantity,
     int ReorderLevel,
-    decimal UnitPrice);
+    decimal UnitPrice,
+    string? Currency = "SAR",
+    Guid? SupplierId = null);
 
 public record UpdateInventoryItemRequest(
     string Name,
     string? Description,
     string Category,
     int ReorderLevel,
-    decimal UnitPrice);
+    decimal UnitPrice,
+    string? Currency = "SAR");
 
-public record UpdateItemStockRequest(int Quantity);
+public record UpdateItemStockRequest(int Quantity, string? Reason = null);

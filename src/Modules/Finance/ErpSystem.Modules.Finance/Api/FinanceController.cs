@@ -1,7 +1,12 @@
 using Asp.Versioning;
+using ErpSystem.Domain.Common.ValueObjects;
+using ErpSystem.Modules.Finance.Domain.Entities;
+using ErpSystem.Modules.Finance.Domain.ValueObjects;
+using ErpSystem.Modules.Finance.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace ErpSystem.Modules.Finance.Api;
 
@@ -11,11 +16,16 @@ namespace ErpSystem.Modules.Finance.Api;
 [Authorize]
 public class FinanceController : ControllerBase
 {
-    private static readonly List<TransactionDto> _transactions = GenerateMockTransactions();
+    private readonly FinanceDbContext _context;
+
+    public FinanceController(FinanceDbContext context)
+    {
+        _context = context;
+    }
 
     [HttpGet("transactions")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetTransactions(
+    public async Task<IActionResult> GetTransactions(
         [FromQuery] int pageNumber = 1,
         [FromQuery] int pageSize = 10,
         [FromQuery] string? sortBy = "date",
@@ -24,36 +34,54 @@ public class FinanceController : ControllerBase
         [FromQuery] string? type = null,
         [FromQuery] string? status = null)
     {
-        var query = _transactions.AsQueryable();
+        var query = _context.Transactions.AsQueryable();
 
         if (!string.IsNullOrEmpty(searchTerm))
         {
             query = query.Where(t =>
-                t.Reference.Contains(searchTerm, StringComparison.OrdinalIgnoreCase) ||
-                t.Description.Contains(searchTerm, StringComparison.OrdinalIgnoreCase));
+                t.Reference.Contains(searchTerm) ||
+                t.Description.Contains(searchTerm));
         }
 
         if (!string.IsNullOrEmpty(type))
         {
-            query = query.Where(t => t.Type.Equals(type, StringComparison.OrdinalIgnoreCase));
+            query = query.Where(t => t.Type.Code == type);
         }
 
         if (!string.IsNullOrEmpty(status))
         {
-            query = query.Where(t => t.Status.Equals(status, StringComparison.OrdinalIgnoreCase));
+            query = query.Where(t => t.Status.Code == status);
         }
+
+        var totalCount = await query.CountAsync();
 
         query = sortBy?.ToLower() switch
         {
             "reference" => sortDirection == "asc" ? query.OrderBy(t => t.Reference) : query.OrderByDescending(t => t.Reference),
-            "amount" => sortDirection == "asc" ? query.OrderBy(t => t.Amount) : query.OrderByDescending(t => t.Amount),
-            "type" => sortDirection == "asc" ? query.OrderBy(t => t.Type) : query.OrderByDescending(t => t.Type),
-            "status" => sortDirection == "asc" ? query.OrderBy(t => t.Status) : query.OrderByDescending(t => t.Status),
-            _ => sortDirection == "asc" ? query.OrderBy(t => t.Date) : query.OrderByDescending(t => t.Date)
+            "amount" => sortDirection == "asc" ? query.OrderBy(t => t.Amount.Amount) : query.OrderByDescending(t => t.Amount.Amount),
+            "type" => sortDirection == "asc" ? query.OrderBy(t => t.Type.Code) : query.OrderByDescending(t => t.Type.Code),
+            "status" => sortDirection == "asc" ? query.OrderBy(t => t.Status.Code) : query.OrderByDescending(t => t.Status.Code),
+            _ => sortDirection == "asc" ? query.OrderBy(t => t.TransactionDate) : query.OrderByDescending(t => t.TransactionDate)
         };
 
-        var totalCount = query.Count();
-        var data = query.Skip((pageNumber - 1) * pageSize).Take(pageSize).ToList();
+        var transactions = await query
+            .Skip((pageNumber - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync();
+
+        var data = transactions.Select(t => new TransactionDto
+        {
+            Id = t.Id.ToString(),
+            Reference = t.Reference,
+            Type = t.Type.Code,
+            Category = t.Category,
+            Amount = t.Amount.Amount,
+            Currency = t.Amount.Currency,
+            Description = t.Description,
+            Status = t.Status.Code,
+            Date = t.TransactionDate,
+            CreatedAt = t.CreatedAt
+        }).ToList();
 
         return Ok(new PaginatedResponse<TransactionDto>
         {
@@ -64,47 +92,138 @@ public class FinanceController : ControllerBase
         });
     }
 
-    [HttpGet("transactions/{id:int}")]
+    [HttpGet("transactions/{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult GetTransaction(int id)
+    public async Task<IActionResult> GetTransaction(string id)
     {
-        var transaction = _transactions.FirstOrDefault(t => t.Id == id);
+        if (!Guid.TryParse(id, out var transactionId))
+            return NotFound(new { message = "المعاملة غير موجودة" });
+
+        var transaction = await _context.Transactions.FindAsync(transactionId);
         if (transaction == null)
             return NotFound(new { message = "المعاملة غير موجودة" });
 
-        return Ok(transaction);
+        return Ok(new TransactionDto
+        {
+            Id = transaction.Id.ToString(),
+            Reference = transaction.Reference,
+            Type = transaction.Type.Code,
+            Category = transaction.Category,
+            Amount = transaction.Amount.Amount,
+            Currency = transaction.Amount.Currency,
+            Description = transaction.Description,
+            Status = transaction.Status.Code,
+            Date = transaction.TransactionDate,
+            CreatedAt = transaction.CreatedAt
+        });
     }
 
     [HttpPost("transactions")]
     [ProducesResponseType(StatusCodes.Status201Created)]
-    public IActionResult CreateTransaction([FromBody] CreateTransactionRequest request)
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> CreateTransaction([FromBody] CreateTransactionRequest request)
     {
-        var newId = _transactions.Max(t => t.Id) + 1;
-        var transaction = new TransactionDto
-        {
-            Id = newId,
-            Reference = $"TXN-{DateTime.UtcNow:yyyyMMdd}-{newId:D4}",
-            Type = request.Type,
-            Category = request.Category,
-            Amount = request.Amount,
-            Description = request.Description,
-            Status = "Pending",
-            Date = DateTime.UtcNow,
-            CreatedAt = DateTime.UtcNow
-        };
+        var transactionType = TransactionType.FromCode(request.Type);
+        if (transactionType == null)
+            return BadRequest(new { message = "نوع المعاملة غير صالح" });
 
-        _transactions.Add(transaction);
-        return CreatedAtAction(nameof(GetTransaction), new { id = transaction.Id }, transaction);
+        var amount = Money.Create(request.Amount, request.Currency ?? "SAR");
+
+        var transaction = Transaction.Create(
+            transactionType,
+            request.Category,
+            amount,
+            request.Description,
+            request.Date);
+
+        _context.Transactions.Add(transaction);
+        await _context.SaveChangesAsync();
+
+        return CreatedAtAction(nameof(GetTransaction), new { id = transaction.Id }, new TransactionDto
+        {
+            Id = transaction.Id.ToString(),
+            Reference = transaction.Reference,
+            Type = transaction.Type.Code,
+            Category = transaction.Category,
+            Amount = transaction.Amount.Amount,
+            Currency = transaction.Amount.Currency,
+            Description = transaction.Description,
+            Status = transaction.Status.Code,
+            Date = transaction.TransactionDate,
+            CreatedAt = transaction.CreatedAt
+        });
+    }
+
+    [HttpPatch("transactions/{id}/complete")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> CompleteTransaction(string id)
+    {
+        if (!Guid.TryParse(id, out var transactionId))
+            return NotFound(new { message = "المعاملة غير موجودة" });
+
+        var transaction = await _context.Transactions.FindAsync(transactionId);
+        if (transaction == null)
+            return NotFound(new { message = "المعاملة غير موجودة" });
+
+        try
+        {
+            transaction.Complete();
+            await _context.SaveChangesAsync();
+
+            return Ok(new { id = transaction.Id, status = transaction.Status.Code });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    [HttpPatch("transactions/{id}/cancel")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> CancelTransaction(string id, [FromBody] CancelTransactionRequest request)
+    {
+        if (!Guid.TryParse(id, out var transactionId))
+            return NotFound(new { message = "المعاملة غير موجودة" });
+
+        var transaction = await _context.Transactions.FindAsync(transactionId);
+        if (transaction == null)
+            return NotFound(new { message = "المعاملة غير موجودة" });
+
+        try
+        {
+            transaction.Cancel(request.Reason ?? "تم الإلغاء بواسطة المستخدم");
+            await _context.SaveChangesAsync();
+
+            return Ok(new { id = transaction.Id, status = transaction.Status.Code });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
     }
 
     [HttpGet("summary")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetFinancialSummary()
+    public async Task<IActionResult> GetFinancialSummary()
     {
-        var totalIncome = _transactions.Where(t => t.Type == "Income").Sum(t => t.Amount);
-        var totalExpenses = _transactions.Where(t => t.Type == "Expense").Sum(t => t.Amount);
-        var pendingPayments = _transactions.Where(t => t.Status == "Pending").Sum(t => t.Amount);
+        var transactions = await _context.Transactions.ToListAsync();
+
+        var totalIncome = transactions
+            .Where(t => t.Type.Code == TransactionType.Income.Code)
+            .Sum(t => t.Amount.Amount);
+
+        var totalExpenses = transactions
+            .Where(t => t.Type.Code == TransactionType.Expense.Code)
+            .Sum(t => t.Amount.Amount);
+
+        var pendingPayments = transactions
+            .Where(t => t.Status.Code == TransactionStatus.Pending.Code)
+            .Sum(t => t.Amount.Amount);
 
         return Ok(new
         {
@@ -112,55 +231,38 @@ public class FinanceController : ControllerBase
             TotalExpenses = totalExpenses,
             NetBalance = totalIncome - totalExpenses,
             PendingPayments = pendingPayments,
-            TransactionCount = _transactions.Count
+            TransactionCount = transactions.Count
         });
     }
 
     [HttpGet("categories")]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetCategories()
+    public async Task<IActionResult> GetCategories()
     {
-        var categories = _transactions.Select(t => t.Category).Distinct().ToList();
+        var categories = await _context.Transactions
+            .Select(t => t.Category)
+            .Distinct()
+            .ToListAsync();
+
         return Ok(categories);
     }
 
-    private static List<TransactionDto> GenerateMockTransactions()
+    [HttpDelete("transactions/{id}")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> DeleteTransaction(string id)
     {
-        var types = new[] { "Income", "Expense" };
-        var statuses = new[] { "Completed", "Pending", "Cancelled" };
-        var categories = new[]
-        {
-            ("Sales", "Income"),
-            ("Services", "Income"),
-            ("Salaries", "Expense"),
-            ("Utilities", "Expense"),
-            ("Supplies", "Expense"),
-            ("Rent", "Expense"),
-            ("Marketing", "Expense"),
-            ("Refunds", "Expense")
-        };
+        if (!Guid.TryParse(id, out var transactionId))
+            return NotFound(new { message = "المعاملة غير موجودة" });
 
-        var transactions = new List<TransactionDto>();
-        var random = new Random(42);
+        var transaction = await _context.Transactions.FindAsync(transactionId);
+        if (transaction == null)
+            return NotFound(new { message = "المعاملة غير موجودة" });
 
-        for (int i = 1; i <= 50; i++)
-        {
-            var category = categories[random.Next(categories.Length)];
-            transactions.Add(new TransactionDto
-            {
-                Id = i,
-                Reference = $"TXN-{DateTime.UtcNow.AddDays(-random.Next(1, 90)):yyyyMMdd}-{i:D4}",
-                Type = category.Item2,
-                Category = category.Item1,
-                Amount = Math.Round((decimal)(random.NextDouble() * 10000 + 100), 2),
-                Description = $"معاملة {category.Item1} رقم {i}",
-                Status = statuses[random.Next(statuses.Length)],
-                Date = DateTime.UtcNow.AddDays(-random.Next(1, 90)),
-                CreatedAt = DateTime.UtcNow.AddDays(-random.Next(1, 90))
-            });
-        }
+        _context.Transactions.Remove(transaction);
+        await _context.SaveChangesAsync();
 
-        return transactions;
+        return NoContent();
     }
 }
 
@@ -174,11 +276,12 @@ public class PaginatedResponse<T>
 
 public class TransactionDto
 {
-    public int Id { get; set; }
+    public string Id { get; set; } = string.Empty;
     public string Reference { get; set; } = string.Empty;
     public string Type { get; set; } = string.Empty;
     public string Category { get; set; } = string.Empty;
     public decimal Amount { get; set; }
+    public string Currency { get; set; } = "SAR";
     public string Description { get; set; } = string.Empty;
     public string Status { get; set; } = string.Empty;
     public DateTime Date { get; set; }
@@ -189,4 +292,8 @@ public record CreateTransactionRequest(
     string Type,
     string Category,
     decimal Amount,
-    string Description);
+    string Description,
+    string? Currency = "SAR",
+    DateTime? Date = null);
+
+public record CancelTransactionRequest(string? Reason = null);

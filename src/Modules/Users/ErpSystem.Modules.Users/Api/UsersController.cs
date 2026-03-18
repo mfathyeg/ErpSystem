@@ -1,7 +1,10 @@
 using Asp.Versioning;
+using ErpSystem.Modules.Identity.Models;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace ErpSystem.Modules.Users.Api;
 
@@ -11,11 +14,20 @@ namespace ErpSystem.Modules.Users.Api;
 [Authorize]
 public class UsersController : ControllerBase
 {
-    private static readonly List<UserDto> _users = GenerateMockUsers();
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly RoleManager<IdentityRole<Guid>> _roleManager;
+
+    public UsersController(
+        UserManager<ApplicationUser> userManager,
+        RoleManager<IdentityRole<Guid>> roleManager)
+    {
+        _userManager = userManager;
+        _roleManager = roleManager;
+    }
 
     [HttpGet]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetUsers(
+    public async Task<IActionResult> GetUsers(
         [FromQuery] int pageNumber = 1,
         [FromQuery] int pageSize = 10,
         [FromQuery] string? sortBy = "createdAt",
@@ -24,20 +36,15 @@ public class UsersController : ControllerBase
         [FromQuery] string? role = null,
         [FromQuery] bool? isActive = null)
     {
-        var query = _users.AsQueryable();
+        var query = _userManager.Users.AsQueryable();
 
         if (!string.IsNullOrEmpty(searchTerm))
         {
             query = query.Where(u =>
-                u.Username.Contains(searchTerm, StringComparison.OrdinalIgnoreCase) ||
-                u.Email.Contains(searchTerm, StringComparison.OrdinalIgnoreCase) ||
-                u.FirstName.Contains(searchTerm, StringComparison.OrdinalIgnoreCase) ||
-                u.LastName.Contains(searchTerm, StringComparison.OrdinalIgnoreCase));
-        }
-
-        if (!string.IsNullOrEmpty(role))
-        {
-            query = query.Where(u => u.Role.Equals(role, StringComparison.OrdinalIgnoreCase));
+                u.UserName!.Contains(searchTerm) ||
+                u.Email!.Contains(searchTerm) ||
+                u.FirstName.Contains(searchTerm) ||
+                u.LastName.Contains(searchTerm));
         }
 
         if (isActive.HasValue)
@@ -47,142 +54,218 @@ public class UsersController : ControllerBase
 
         query = sortBy?.ToLower() switch
         {
-            "username" => sortDirection == "asc" ? query.OrderBy(u => u.Username) : query.OrderByDescending(u => u.Username),
+            "username" => sortDirection == "asc" ? query.OrderBy(u => u.UserName) : query.OrderByDescending(u => u.UserName),
             "email" => sortDirection == "asc" ? query.OrderBy(u => u.Email) : query.OrderByDescending(u => u.Email),
-            "role" => sortDirection == "asc" ? query.OrderBy(u => u.Role) : query.OrderByDescending(u => u.Role),
             "firstname" => sortDirection == "asc" ? query.OrderBy(u => u.FirstName) : query.OrderByDescending(u => u.FirstName),
             _ => sortDirection == "asc" ? query.OrderBy(u => u.CreatedAt) : query.OrderByDescending(u => u.CreatedAt)
         };
 
-        var totalCount = query.Count();
-        var data = query.Skip((pageNumber - 1) * pageSize).Take(pageSize).ToList();
+        var totalCount = await query.CountAsync();
+        var users = await query.Skip((pageNumber - 1) * pageSize).Take(pageSize).ToListAsync();
+
+        var userDtos = new List<UserDto>();
+        foreach (var user in users)
+        {
+            var roles = await _userManager.GetRolesAsync(user);
+            var userRole = roles.FirstOrDefault() ?? "Employee";
+
+            // Filter by role if specified
+            if (!string.IsNullOrEmpty(role) && !userRole.Equals(role, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            userDtos.Add(new UserDto
+            {
+                Id = user.Id.ToString(),
+                Username = user.UserName ?? string.Empty,
+                Email = user.Email ?? string.Empty,
+                FirstName = user.FirstName,
+                LastName = user.LastName,
+                Role = userRole,
+                IsActive = user.IsActive,
+                CreatedAt = user.CreatedAt,
+                LastLogin = user.LastLoginAt
+            });
+        }
 
         return Ok(new PaginatedResponse<UserDto>
         {
-            Data = data,
+            Data = userDtos,
             TotalCount = totalCount,
             PageNumber = pageNumber,
             PageSize = pageSize
         });
     }
 
-    [HttpGet("{id:int}")]
+    [HttpGet("{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult GetUser(int id)
+    public async Task<IActionResult> GetUser(string id)
     {
-        var user = _users.FirstOrDefault(u => u.Id == id);
+        var user = await _userManager.FindByIdAsync(id);
         if (user == null)
             return NotFound(new { message = "المستخدم غير موجود" });
 
-        return Ok(user);
+        var roles = await _userManager.GetRolesAsync(user);
+
+        return Ok(new UserDto
+        {
+            Id = user.Id.ToString(),
+            Username = user.UserName ?? string.Empty,
+            Email = user.Email ?? string.Empty,
+            FirstName = user.FirstName,
+            LastName = user.LastName,
+            Role = roles.FirstOrDefault() ?? "Employee",
+            IsActive = user.IsActive,
+            CreatedAt = user.CreatedAt,
+            LastLogin = user.LastLoginAt
+        });
     }
 
     [HttpPost]
     [ProducesResponseType(StatusCodes.Status201Created)]
-    public IActionResult CreateUser([FromBody] CreateUserRequest request)
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> CreateUser([FromBody] CreateUserRequest request)
     {
-        var newId = _users.Max(u => u.Id) + 1;
-        var user = new UserDto
+        var existingUser = await _userManager.FindByNameAsync(request.Username);
+        if (existingUser != null)
+            return BadRequest(new { message = "اسم المستخدم موجود بالفعل" });
+
+        var existingEmail = await _userManager.FindByEmailAsync(request.Email);
+        if (existingEmail != null)
+            return BadRequest(new { message = "البريد الإلكتروني مسجل بالفعل" });
+
+        var user = new ApplicationUser
         {
-            Id = newId,
-            Username = request.Username,
+            UserName = request.Username,
             Email = request.Email,
             FirstName = request.FirstName,
             LastName = request.LastName,
-            Role = request.Role,
             IsActive = true,
             CreatedAt = DateTime.UtcNow
         };
 
-        _users.Add(user);
-        return CreatedAtAction(nameof(GetUser), new { id = user.Id }, user);
+        var result = await _userManager.CreateAsync(user, request.Password);
+        if (!result.Succeeded)
+            return BadRequest(new { message = string.Join(", ", result.Errors.Select(e => e.Description)) });
+
+        // Assign role
+        if (!string.IsNullOrEmpty(request.Role))
+        {
+            var roleExists = await _roleManager.RoleExistsAsync(request.Role);
+            if (roleExists)
+            {
+                await _userManager.AddToRoleAsync(user, request.Role);
+            }
+        }
+
+        var roles = await _userManager.GetRolesAsync(user);
+        var userDto = new UserDto
+        {
+            Id = user.Id.ToString(),
+            Username = user.UserName ?? string.Empty,
+            Email = user.Email ?? string.Empty,
+            FirstName = user.FirstName,
+            LastName = user.LastName,
+            Role = roles.FirstOrDefault() ?? "Employee",
+            IsActive = user.IsActive,
+            CreatedAt = user.CreatedAt
+        };
+
+        return CreatedAtAction(nameof(GetUser), new { id = user.Id }, userDto);
     }
 
-    [HttpPut("{id:int}")]
+    [HttpPut("{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult UpdateUser(int id, [FromBody] UpdateUserRequest request)
+    public async Task<IActionResult> UpdateUser(string id, [FromBody] UpdateUserRequest request)
     {
-        var user = _users.FirstOrDefault(u => u.Id == id);
+        var user = await _userManager.FindByIdAsync(id);
         if (user == null)
             return NotFound(new { message = "المستخدم غير موجود" });
 
         user.FirstName = request.FirstName;
         user.LastName = request.LastName;
         user.Email = request.Email;
-        user.Role = request.Role;
         user.IsActive = request.IsActive;
-        user.UpdatedAt = DateTime.UtcNow;
 
-        return Ok(user);
+        var result = await _userManager.UpdateAsync(user);
+        if (!result.Succeeded)
+            return BadRequest(new { message = string.Join(", ", result.Errors.Select(e => e.Description)) });
+
+        // Update role
+        var currentRoles = await _userManager.GetRolesAsync(user);
+        if (currentRoles.Any())
+        {
+            await _userManager.RemoveFromRolesAsync(user, currentRoles);
+        }
+        if (!string.IsNullOrEmpty(request.Role))
+        {
+            var roleExists = await _roleManager.RoleExistsAsync(request.Role);
+            if (roleExists)
+            {
+                await _userManager.AddToRoleAsync(user, request.Role);
+            }
+        }
+
+        var roles = await _userManager.GetRolesAsync(user);
+        return Ok(new UserDto
+        {
+            Id = user.Id.ToString(),
+            Username = user.UserName ?? string.Empty,
+            Email = user.Email ?? string.Empty,
+            FirstName = user.FirstName,
+            LastName = user.LastName,
+            Role = roles.FirstOrDefault() ?? "Employee",
+            IsActive = user.IsActive,
+            CreatedAt = user.CreatedAt,
+            LastLogin = user.LastLoginAt
+        });
     }
 
-    [HttpDelete("{id:int}")]
+    [HttpDelete("{id}")]
     [ProducesResponseType(StatusCodes.Status204NoContent)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult DeleteUser(int id)
+    public async Task<IActionResult> DeleteUser(string id)
     {
-        var user = _users.FirstOrDefault(u => u.Id == id);
+        var user = await _userManager.FindByIdAsync(id);
         if (user == null)
             return NotFound(new { message = "المستخدم غير موجود" });
 
-        _users.Remove(user);
+        var result = await _userManager.DeleteAsync(user);
+        if (!result.Succeeded)
+            return BadRequest(new { message = string.Join(", ", result.Errors.Select(e => e.Description)) });
+
         return NoContent();
     }
 
-    [HttpPatch("{id:int}/toggle-status")]
+    [HttpPatch("{id}/toggle-status")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult ToggleUserStatus(int id)
+    public async Task<IActionResult> ToggleUserStatus(string id)
     {
-        var user = _users.FirstOrDefault(u => u.Id == id);
+        var user = await _userManager.FindByIdAsync(id);
         if (user == null)
             return NotFound(new { message = "المستخدم غير موجود" });
 
         user.IsActive = !user.IsActive;
-        user.UpdatedAt = DateTime.UtcNow;
-        return Ok(user);
-    }
+        var result = await _userManager.UpdateAsync(user);
 
-    private static List<UserDto> GenerateMockUsers()
-    {
-        var roles = new[] { "Admin", "Manager", "Employee", "Viewer" };
-        var names = new[]
+        if (!result.Succeeded)
+            return BadRequest(new { message = string.Join(", ", result.Errors.Select(e => e.Description)) });
+
+        var roles = await _userManager.GetRolesAsync(user);
+        return Ok(new UserDto
         {
-            ("أحمد", "محمد", "ahmed"),
-            ("سارة", "علي", "sara"),
-            ("خالد", "عبدالله", "khaled"),
-            ("نورة", "سعيد", "noura"),
-            ("فهد", "العتيبي", "fahad"),
-            ("ريم", "الشمري", "reem"),
-            ("محمد", "القحطاني", "mohammed"),
-            ("لينا", "الحربي", "lina"),
-            ("عبدالرحمن", "السعيد", "abdulrahman"),
-            ("هند", "الزهراني", "hind")
-        };
-
-        var users = new List<UserDto>();
-        var random = new Random(42);
-
-        for (int i = 0; i < names.Length; i++)
-        {
-            var name = names[i];
-            users.Add(new UserDto
-            {
-                Id = i + 1,
-                Username = name.Item3,
-                Email = $"{name.Item3}@duralux.sa",
-                FirstName = name.Item1,
-                LastName = name.Item2,
-                Role = roles[i % roles.Length],
-                IsActive = random.Next(10) > 1,
-                CreatedAt = DateTime.UtcNow.AddDays(-random.Next(1, 365)),
-                LastLogin = DateTime.UtcNow.AddHours(-random.Next(1, 72))
-            });
-        }
-
-        return users;
+            Id = user.Id.ToString(),
+            Username = user.UserName ?? string.Empty,
+            Email = user.Email ?? string.Empty,
+            FirstName = user.FirstName,
+            LastName = user.LastName,
+            Role = roles.FirstOrDefault() ?? "Employee",
+            IsActive = user.IsActive,
+            CreatedAt = user.CreatedAt,
+            LastLogin = user.LastLoginAt
+        });
     }
 }
 
@@ -196,7 +279,7 @@ public class PaginatedResponse<T>
 
 public class UserDto
 {
-    public int Id { get; set; }
+    public string Id { get; set; } = string.Empty;
     public string Username { get; set; } = string.Empty;
     public string Email { get; set; } = string.Empty;
     public string FirstName { get; set; } = string.Empty;

@@ -1,7 +1,12 @@
 using Asp.Versioning;
+using ErpSystem.Domain.Common.ValueObjects;
+using ErpSystem.Modules.Orders.Domain.Entities;
+using ErpSystem.Modules.Orders.Domain.ValueObjects;
+using ErpSystem.Modules.Orders.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 
 namespace ErpSystem.Modules.Orders.Api;
 
@@ -11,11 +16,16 @@ namespace ErpSystem.Modules.Orders.Api;
 [Authorize]
 public class OrdersController : ControllerBase
 {
-    private static readonly List<OrderDto> _orders = GenerateMockOrders();
+    private readonly OrdersDbContext _context;
+
+    public OrdersController(OrdersDbContext context)
+    {
+        _context = context;
+    }
 
     [HttpGet]
     [ProducesResponseType(StatusCodes.Status200OK)]
-    public IActionResult GetOrders(
+    public async Task<IActionResult> GetOrders(
         [FromQuery] int pageNumber = 1,
         [FromQuery] int pageSize = 10,
         [FromQuery] string? sortBy = "orderDate",
@@ -23,31 +33,73 @@ public class OrdersController : ControllerBase
         [FromQuery] string? searchTerm = null,
         [FromQuery] string? status = null)
     {
-        var query = _orders.AsQueryable();
+        var query = _context.Orders
+            .Include(o => o.Items)
+            .AsQueryable();
 
         if (!string.IsNullOrEmpty(searchTerm))
         {
-            query = query.Where(o =>
-                o.OrderNumber.Contains(searchTerm, StringComparison.OrdinalIgnoreCase) ||
-                o.CustomerName.Contains(searchTerm, StringComparison.OrdinalIgnoreCase));
+            query = query.Where(o => o.OrderNumber.Contains(searchTerm));
         }
 
         if (!string.IsNullOrEmpty(status))
         {
-            query = query.Where(o => o.Status.Equals(status, StringComparison.OrdinalIgnoreCase));
+            var orderStatus = OrderStatus.FromName(status);
+            if (orderStatus != null)
+            {
+                query = query.Where(o => o.Status == orderStatus);
+            }
         }
+
+        var totalCount = await query.CountAsync();
 
         query = sortBy?.ToLower() switch
         {
             "ordernumber" => sortDirection == "asc" ? query.OrderBy(o => o.OrderNumber) : query.OrderByDescending(o => o.OrderNumber),
-            "customername" => sortDirection == "asc" ? query.OrderBy(o => o.CustomerName) : query.OrderByDescending(o => o.CustomerName),
-            "totalamount" => sortDirection == "asc" ? query.OrderBy(o => o.TotalAmount) : query.OrderByDescending(o => o.TotalAmount),
-            "status" => sortDirection == "asc" ? query.OrderBy(o => o.Status) : query.OrderByDescending(o => o.Status),
-            _ => sortDirection == "asc" ? query.OrderBy(o => o.OrderDate) : query.OrderByDescending(o => o.OrderDate)
+            "totalamount" => sortDirection == "asc" ? query.OrderBy(o => o.Total.Amount) : query.OrderByDescending(o => o.Total.Amount),
+            _ => sortDirection == "asc" ? query.OrderBy(o => o.CreatedAt) : query.OrderByDescending(o => o.CreatedAt)
         };
 
-        var totalCount = query.Count();
-        var data = query.Skip((pageNumber - 1) * pageSize).Take(pageSize).ToList();
+        var orders = await query
+            .Skip((pageNumber - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync();
+
+        var data = orders.Select(o => new OrderDto
+        {
+            Id = o.Id.ToString(),
+            OrderNumber = o.OrderNumber,
+            CustomerId = o.CustomerId.ToString(),
+            CustomerName = "عميل", // Would need to join with customer table
+            Status = o.Status.Name,
+            OrderDate = o.CreatedAt,
+            TotalAmount = o.Total.Amount,
+            ShippingAddress = new AddressDto
+            {
+                Street = o.ShippingAddress.Street,
+                City = o.ShippingAddress.City,
+                State = o.ShippingAddress.State,
+                PostalCode = o.ShippingAddress.PostalCode,
+                Country = o.ShippingAddress.Country
+            },
+            BillingAddress = o.BillingAddress != null ? new AddressDto
+            {
+                Street = o.BillingAddress.Street,
+                City = o.BillingAddress.City,
+                State = o.BillingAddress.State,
+                PostalCode = o.BillingAddress.PostalCode,
+                Country = o.BillingAddress.Country
+            } : null,
+            Items = o.Items.Select(i => new OrderItemDto
+            {
+                ProductId = i.ProductId,
+                ProductName = i.ProductName,
+                Sku = i.Sku,
+                Quantity = i.Quantity,
+                UnitPrice = i.UnitPrice.Amount
+            }).ToList(),
+            CreatedAt = o.CreatedAt
+        }).ToList();
 
         return Ok(new PaginatedResponse<OrderDto>
         {
@@ -58,133 +110,161 @@ public class OrdersController : ControllerBase
         });
     }
 
-    [HttpGet("{id:int}")]
+    [HttpGet("{id}")]
     [ProducesResponseType(StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult GetOrder(int id)
+    public async Task<IActionResult> GetOrder(string id)
     {
-        var order = _orders.FirstOrDefault(o => o.Id == id);
+        if (!Guid.TryParse(id, out var orderId))
+            return NotFound(new { message = "الطلب غير موجود" });
+
+        var order = await _context.Orders
+            .Include(o => o.Items)
+            .FirstOrDefaultAsync(o => o.Id == orderId);
+
         if (order == null)
             return NotFound(new { message = "الطلب غير موجود" });
 
-        return Ok(order);
-    }
-
-    [HttpPost]
-    [ProducesResponseType(StatusCodes.Status201Created)]
-    public IActionResult CreateOrder([FromBody] CreateOrderRequest request)
-    {
-        var newId = _orders.Max(o => o.Id) + 1;
-        var order = new OrderDto
+        return Ok(new OrderDto
         {
-            Id = newId,
-            OrderNumber = $"ORD-2024-{newId:D3}",
-            CustomerId = 1,
-            CustomerName = "عميل جديد",
-            Status = "Pending",
-            OrderDate = DateTime.UtcNow,
-            TotalAmount = request.Items.Sum(i => i.Quantity * i.UnitPrice),
+            Id = order.Id.ToString(),
+            OrderNumber = order.OrderNumber,
+            CustomerId = order.CustomerId.ToString(),
+            CustomerName = "عميل",
+            Status = order.Status.Name,
+            OrderDate = order.CreatedAt,
+            TotalAmount = order.Total.Amount,
             ShippingAddress = new AddressDto
             {
-                Street = request.ShippingAddress.Street,
-                City = request.ShippingAddress.City,
-                State = request.ShippingAddress.State,
-                PostalCode = request.ShippingAddress.PostalCode,
-                Country = request.ShippingAddress.Country
+                Street = order.ShippingAddress.Street,
+                City = order.ShippingAddress.City,
+                State = order.ShippingAddress.State,
+                PostalCode = order.ShippingAddress.PostalCode,
+                Country = order.ShippingAddress.Country
             },
-            BillingAddress = request.BillingAddress != null ? new AddressDto
+            BillingAddress = order.BillingAddress != null ? new AddressDto
             {
-                Street = request.BillingAddress.Street,
-                City = request.BillingAddress.City,
-                State = request.BillingAddress.State,
-                PostalCode = request.BillingAddress.PostalCode,
-                Country = request.BillingAddress.Country
+                Street = order.BillingAddress.Street,
+                City = order.BillingAddress.City,
+                State = order.BillingAddress.State,
+                PostalCode = order.BillingAddress.PostalCode,
+                Country = order.BillingAddress.Country
             } : null,
-            Items = request.Items.Select(i => new OrderItemDto
+            Items = order.Items.Select(i => new OrderItemDto
             {
                 ProductId = i.ProductId,
                 ProductName = i.ProductName,
                 Sku = i.Sku,
                 Quantity = i.Quantity,
-                UnitPrice = i.UnitPrice
+                UnitPrice = i.UnitPrice.Amount
             }).ToList(),
-            CreatedAt = DateTime.UtcNow
-        };
-
-        _orders.Add(order);
-        return CreatedAtAction(nameof(GetOrder), new { id = order.Id }, order);
+            CreatedAt = order.CreatedAt
+        });
     }
 
-    [HttpPatch("{id:int}/status")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult UpdateStatus(int id, [FromBody] UpdateStatusRequest request)
+    [HttpPost]
+    [ProducesResponseType(StatusCodes.Status201Created)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> CreateOrder([FromBody] CreateOrderRequest request)
     {
-        var order = _orders.FirstOrDefault(o => o.Id == id);
-        if (order == null)
-            return NotFound(new { message = "الطلب غير موجود" });
+        var shippingAddress = Address.Create(
+            request.ShippingAddress.Street,
+            request.ShippingAddress.City,
+            request.ShippingAddress.State,
+            request.ShippingAddress.PostalCode,
+            request.ShippingAddress.Country);
 
-        order.Status = request.Status;
-        return Ok(order);
-    }
+        Address? billingAddress = request.BillingAddress != null
+            ? Address.Create(
+                request.BillingAddress.Street,
+                request.BillingAddress.City,
+                request.BillingAddress.State,
+                request.BillingAddress.PostalCode,
+                request.BillingAddress.Country)
+            : null;
 
-    [HttpDelete("{id:int}")]
-    [ProducesResponseType(StatusCodes.Status204NoContent)]
-    [ProducesResponseType(StatusCodes.Status404NotFound)]
-    public IActionResult DeleteOrder(int id)
-    {
-        var order = _orders.FirstOrDefault(o => o.Id == id);
-        if (order == null)
-            return NotFound(new { message = "الطلب غير موجود" });
+        var order = Order.Create(
+            request.CustomerId,
+            shippingAddress,
+            billingAddress,
+            request.Currency ?? "SAR");
 
-        _orders.Remove(order);
-        return NoContent();
-    }
-
-    private static List<OrderDto> GenerateMockOrders()
-    {
-        var statuses = new[] { "Pending", "Confirmed", "Processing", "Shipped", "Delivered", "Cancelled" };
-        var customers = new[]
+        foreach (var item in request.Items)
         {
-            ("أحمد محمد", "الرياض"),
-            ("سارة علي", "جدة"),
-            ("خالد عبدالله", "الدمام"),
-            ("نورة سعيد", "مكة"),
-            ("فهد العتيبي", "المدينة"),
-            ("ريم الشمري", "الخبر"),
-            ("محمد القحطاني", "تبوك"),
-            ("لينا الحربي", "أبها")
-        };
-
-        var orders = new List<OrderDto>();
-        var random = new Random(42);
-
-        for (int i = 1; i <= 50; i++)
-        {
-            var customer = customers[random.Next(customers.Length)];
-            orders.Add(new OrderDto
-            {
-                Id = i,
-                OrderNumber = $"ORD-2024-{i:D3}",
-                CustomerId = i,
-                CustomerName = customer.Item1,
-                Status = statuses[random.Next(statuses.Length)],
-                OrderDate = DateTime.UtcNow.AddDays(-random.Next(1, 60)),
-                TotalAmount = Math.Round((decimal)(random.NextDouble() * 5000 + 100), 2),
-                ShippingAddress = new AddressDto
-                {
-                    Street = $"شارع {random.Next(1, 100)}",
-                    City = customer.Item2,
-                    State = customer.Item2,
-                    PostalCode = $"{random.Next(10000, 99999)}",
-                    Country = "السعودية"
-                },
-                Items = new List<OrderItemDto>(),
-                CreatedAt = DateTime.UtcNow.AddDays(-random.Next(1, 60))
-            });
+            order.AddItem(
+                item.ProductId,
+                item.ProductName,
+                item.Sku,
+                item.Quantity,
+                Money.Create(item.UnitPrice, request.Currency ?? "SAR"));
         }
 
-        return orders;
+        order.Submit();
+
+        _context.Orders.Add(order);
+        await _context.SaveChangesAsync();
+
+        return CreatedAtAction(nameof(GetOrder), new { id = order.Id }, new { id = order.Id, orderNumber = order.OrderNumber });
+    }
+
+    [HttpPatch("{id}/status")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> UpdateStatus(string id, [FromBody] UpdateStatusRequest request)
+    {
+        if (!Guid.TryParse(id, out var orderId))
+            return NotFound(new { message = "الطلب غير موجود" });
+
+        var order = await _context.Orders.FindAsync(orderId);
+        if (order == null)
+            return NotFound(new { message = "الطلب غير موجود" });
+
+        try
+        {
+            switch (request.Status.ToLower())
+            {
+                case "confirmed":
+                    order.Confirm();
+                    break;
+                case "shipped":
+                    order.Ship();
+                    break;
+                case "delivered":
+                    order.Deliver();
+                    break;
+                case "cancelled":
+                    order.Cancel(request.Reason ?? "تم الإلغاء بواسطة المستخدم");
+                    break;
+                default:
+                    return BadRequest(new { message = "حالة غير صالحة" });
+            }
+
+            await _context.SaveChangesAsync();
+            return Ok(new { id = order.Id, status = order.Status.Name });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { message = ex.Message });
+        }
+    }
+
+    [HttpDelete("{id}")]
+    [ProducesResponseType(StatusCodes.Status204NoContent)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<IActionResult> DeleteOrder(string id)
+    {
+        if (!Guid.TryParse(id, out var orderId))
+            return NotFound(new { message = "الطلب غير موجود" });
+
+        var order = await _context.Orders.FindAsync(orderId);
+        if (order == null)
+            return NotFound(new { message = "الطلب غير موجود" });
+
+        _context.Orders.Remove(order);
+        await _context.SaveChangesAsync();
+
+        return NoContent();
     }
 }
 
@@ -198,9 +278,9 @@ public class PaginatedResponse<T>
 
 public class OrderDto
 {
-    public int Id { get; set; }
+    public string Id { get; set; } = string.Empty;
     public string OrderNumber { get; set; } = string.Empty;
-    public int CustomerId { get; set; }
+    public string CustomerId { get; set; } = string.Empty;
     public string CustomerName { get; set; } = string.Empty;
     public string Status { get; set; } = string.Empty;
     public DateTime OrderDate { get; set; }
@@ -233,7 +313,7 @@ public record CreateOrderRequest(
     Guid CustomerId,
     AddressRequest ShippingAddress,
     AddressRequest? BillingAddress,
-    string Currency,
+    string? Currency,
     List<OrderItemRequest> Items);
 
 public record AddressRequest(
@@ -250,4 +330,4 @@ public record OrderItemRequest(
     int Quantity,
     decimal UnitPrice);
 
-public record UpdateStatusRequest(string Status);
+public record UpdateStatusRequest(string Status, string? Reason = null);
