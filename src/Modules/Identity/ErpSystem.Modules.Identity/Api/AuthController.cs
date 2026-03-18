@@ -1,3 +1,4 @@
+using Asp.Versioning;
 using ErpSystem.Modules.Identity.Models;
 using ErpSystem.Modules.Identity.Services;
 using Microsoft.AspNetCore.Authorization;
