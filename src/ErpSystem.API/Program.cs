@@ -36,9 +36,9 @@ builder.Services.AddIdentityModule(builder.Configuration);
 builder.Services.AddUsersModule();
 builder.Services.AddInventoryModule();
 builder.Services.AddOrdersModule();
-builder.Services.AddFinanceModule();
-builder.Services.AddNotificationsModule();
-builder.Services.AddConfigurationModule();
+builder.Services.AddFinanceModule(builder.Configuration);
+builder.Services.AddNotificationsModule(builder.Configuration);
+builder.Services.AddConfigurationModule(builder.Configuration);
 
 // Add API services
 builder.Services.AddControllers();
@@ -165,8 +165,27 @@ if (app.Environment.IsDevelopment())
     var identityDbContext = scope.ServiceProvider.GetRequiredService<ErpSystem.Modules.Identity.Data.IdentityDbContext>();
     await identityDbContext.Database.MigrateAsync();
 
+    // Module DbContext migrations
+    var inventoryDbContext = scope.ServiceProvider.GetRequiredService<ErpSystem.Modules.Inventory.Infrastructure.Persistence.InventoryDbContext>();
+    await inventoryDbContext.Database.MigrateAsync();
+
+    var ordersDbContext = scope.ServiceProvider.GetRequiredService<ErpSystem.Modules.Orders.Infrastructure.Persistence.OrdersDbContext>();
+    await ordersDbContext.Database.MigrateAsync();
+
+    var financeDbContext = scope.ServiceProvider.GetRequiredService<ErpSystem.Modules.Finance.Infrastructure.Persistence.FinanceDbContext>();
+    await financeDbContext.Database.MigrateAsync();
+
+    var notificationsDbContext = scope.ServiceProvider.GetRequiredService<ErpSystem.Modules.Notifications.Infrastructure.Persistence.NotificationsDbContext>();
+    await notificationsDbContext.Database.MigrateAsync();
+
+    var configurationDbContext = scope.ServiceProvider.GetRequiredService<ErpSystem.Modules.Configuration.Infrastructure.Persistence.ConfigurationDbContext>();
+    await configurationDbContext.Database.MigrateAsync();
+
     // Seed Identity data
     await ErpSystem.Modules.Identity.Data.IdentitySeeder.SeedAsync(app.Services);
+
+    // Seed module data
+    await DataSeeder.SeedAsync(app.Services);
 }
 
 app.Run();

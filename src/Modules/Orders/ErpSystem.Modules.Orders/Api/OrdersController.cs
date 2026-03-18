@@ -171,16 +171,16 @@ public class OrdersController : ControllerBase
             request.ShippingAddress.Street,
             request.ShippingAddress.City,
             request.ShippingAddress.State,
-            request.ShippingAddress.PostalCode,
-            request.ShippingAddress.Country);
+            request.ShippingAddress.Country,
+            request.ShippingAddress.PostalCode);
 
         Address? billingAddress = request.BillingAddress != null
             ? Address.Create(
                 request.BillingAddress.Street,
                 request.BillingAddress.City,
                 request.BillingAddress.State,
-                request.BillingAddress.PostalCode,
-                request.BillingAddress.Country)
+                request.BillingAddress.Country,
+                request.BillingAddress.PostalCode)
             : null;
 
         var order = Order.Create(
